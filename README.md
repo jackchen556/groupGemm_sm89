@@ -1,16 +1,26 @@
 # groupGemm_sm89
 
-M values: 257 251 252 252 253 259 252 251 
-WMMA (Tensor Core) kernel max err: 0.0078125
-
-=== 正确性验证 ===
-Max |CPU - GPU|: 0.0078125
-Error count (tol=1e-2): 0, Inf/NaN: 0
-PASS: 结果正确!
-
-=== 性能 (总 M: 2027, K: 4096, N: 2048) ===
-
-=== WMMA (Tensor Core + 融合 3D grid) [A100 理论 ~312 TFLOPS] ===
-单次耗时: 3.042 ms
-计算效率: 11177.87 GFLOPS/s
-内存带宽: 52.30 GB/s
+Test Configuration
+Parameter	Value
+M Values	257, 251, 252, 252, 253, 259, 252, 251
+Total M	2027
+K	4096
+N	2048
+GPU	NVIDIA A100
+Theoretical Peak	~312 TFLOPS
+Correctness Verification
+Metric	Value
+WMMA Kernel Max Error	0.0078125
+Max |CPU - GPU|	0.0078125
+Error Count (tol=1e-2)	0
+Inf/NaN Count	0
+Status	✅ PASS
+Performance Results
+WMMA (Tensor Core + Fused 3D Grid)
+Metric	Value
+Single Run Latency	3.042 ms
+Compute Efficiency	11177.87 GFLOPS/s
+Memory Bandwidth	52.30 GB/s
+Summary
+✅ Correctness: All tests passed with error tolerance 1e-2
+🚀 Performance: Achieved 11.18 TFLOPS on A100 GPU
