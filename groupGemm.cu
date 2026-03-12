@@ -43,8 +43,6 @@ __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half*
 #define WMMA_BLOCK_DIM 32
 #define WMMA_BLOCK_ROWS 16   // 16 warps = 512 threads, covers 4×4 WMMA tiles
 
-#define SWIZZLE_TILE 16
-
 #define SA_LD 16
 #define SA_BANK_PAD 8
 #define SB_LD 16
@@ -93,11 +91,8 @@ __global__ __launch_bounds__(512) void group_gemm_wmma_fused_kernel(
     int base_B = offset_B[g];
     int base_C = offset_C[g];
 
-    int block_idx = blockIdx.y * gridDim.x + blockIdx.x;
-    int tile_id = block_idx / (SWIZZLE_TILE * gridDim.y);
-    int pos_in_tile = block_idx % (SWIZZLE_TILE * gridDim.y);
-    int blk_y = pos_in_tile / SWIZZLE_TILE;
-    int blk_x = tile_id * SWIZZLE_TILE + (pos_in_tile % SWIZZLE_TILE);
+    int blk_x = blockIdx.x;
+    int blk_y = blockIdx.y;
 
     if (blk_y * WMMA_TILE_M >= Mg) return;
 
@@ -170,7 +165,7 @@ __global__ __launch_bounds__(512) void group_gemm_wmma_fused_kernel(
                     ld_uint4(&B[base_B + n_val * N + k_next + row_base], &sB[next_buf][col][row_base]);
                 else {
                     for (int i = 0; i < 8; i++)
-                        sB[next_buf][col][row_base + i] = (n_val < N && k_next + row_base + i < K) ?
+                        sB[next_buf][col][row_base + i] = (n_val < N && row_base + i < K) ?
                             ld_kernel(&B[base_B + n_val * N + k_next + row_base + i]) : __float2half(0.0f);
                 }
             }
