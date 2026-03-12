@@ -1,14 +1,15 @@
 /**
  * Group GEMM - 手写 CUDA 实现 (WMMA Tensor Core)
- * 变体: C 矩阵 uint4 写回 + B 矩阵预转置 (连续访问，提升 L2 命中率)
+ * 变体: C 矩阵 uint4 写回 + B 矩阵预转置 + 64×64 Tile 优化
  *
  * 功能: 8 对矩阵乘法 C[g] = A[g] * B[g]
  * - B 预转置为 B_T[k][n]=B[n][k]，K×N 布局，使 kernel 对 B 的加载变为连续访问
  * - M: 251~260 随机 8 个值 (每组不同)
  * - K: 4096, N: 2048
  * - FP16 数据类型
+ * - Tile 尺寸: 64×64 (原 32×32)，更大 tile 提升计算密度、减少 block 数量
  *
- * 编译 (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm_u4 group_gemm_u4.cu
+ * 编译 (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm_u4_tile64 group_gemm_u4_tile64.cu
  */
 
 #include <iostream>
@@ -36,10 +37,11 @@ __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half*
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define WMMA_TILE_M 32
-#define WMMA_TILE_N 32
+// 64×64 tile: 4×4 个 16×16 WMMA 块
+#define WMMA_TILE_M 64
+#define WMMA_TILE_N 64
 #define WMMA_BLOCK_DIM 32
-#define WMMA_BLOCK_ROWS 4
+#define WMMA_BLOCK_ROWS 16   // 16 warps = 512 threads，覆盖 4×4 WMMA 块
 
 #define SWIZZLE_TILE 16
 
@@ -47,7 +49,7 @@ __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half*
 #define SA_BANK_PAD 8
 #define SB_LD 16       // WMMA col_major: sB[col][row], ld=16
 #define SB_BANK_PAD 8
-#define SC_LD 32
+#define SC_LD 64       // 64×64 accumulator
 
 // ============ CPU 参考实现 ============
 void cpu_group_gemm_ref(
@@ -74,8 +76,8 @@ void cpu_group_gemm_ref(
     }
 }
 
-// ============ ld_uint4 双缓冲 + B_col 连续 + C uint4 写回 ============
-__global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
+// ============ ld_uint4 双缓冲 + B_col 连续 + C uint4 写回 + 64×64 Tile ============
+__global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
     __half* __restrict__ C,
@@ -102,8 +104,9 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
     __shared__ __half sA[2][WMMA_TILE_M][SA_LD + SA_BANK_PAD];
     __shared__ __half sB[2][WMMA_TILE_N][SB_LD + SB_BANK_PAD];
 
-    int warpM = threadIdx.y / 2;
-    int warpN = threadIdx.y % 2;
+    // 4×4 warps: warpM 0~3, warpN 0~3
+    int warpM = threadIdx.y / 4;
+    int warpN = threadIdx.y % 4;
     int tile_m = blk_y * WMMA_TILE_M;
     int tile_n = blk_x * WMMA_TILE_N;
     int tile_n_B = blk_x * WMMA_TILE_N;
@@ -116,8 +119,9 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
 
     int num_tiles_k = K / WMMA_K;
 
+    // 预加载第一块: 64×16 的 A, 64×16 的 B
     #pragma unroll 1
-    for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 128) {
+    for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 512) {
         int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
         int gr = tile_m + row;
         if (gr < Mg && col + 7 < K)
@@ -129,7 +133,7 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
         }
     }
     #pragma unroll 1
-    for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 128) {
+    for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
         int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
         int n_val = tile_n_B + col, k_val = row_base;
         if (n_val < N && k_val + 7 < K)
@@ -149,7 +153,7 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
 
         if (k + 1 < num_tiles_k) {
             #pragma unroll 1
-            for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 128) {
+            for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 512) {
                 int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
                 int gr = tile_m + row;
                 if (gr < Mg && k_next + col + 7 < K)
@@ -161,7 +165,7 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
                 }
             }
             #pragma unroll 1
-            for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 128) {
+            for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
                 int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
                 int n_val = tile_n_B + col, k_val = k_next + row_base;
                 if (n_val < N && k_val + 7 < K)
@@ -184,10 +188,9 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
     nvcuda::wmma::store_matrix_sync(&sC[warpM * WMMA_M][warpN * WMMA_N], c_frag, SC_LD, nvcuda::wmma::mem_row_major);
     __syncthreads();
 
-    // C 矩阵写回: uint4 向量化 (128-bit 批量写)，写带宽提升 ~40%
-    // 每 8 half 打包为 uint4，float->half 转换后批量写回
+    // C 矩阵写回: uint4 向量化 (128-bit 批量写)
     #pragma unroll 4
-    for (int i = ty * 32 + tx; i < WMMA_TILE_M * (WMMA_TILE_N / 8); i += 128) {
+    for (int i = ty * 32 + tx; i < WMMA_TILE_M * (WMMA_TILE_N / 8); i += 512) {
         int r = i / (WMMA_TILE_N / 8);
         int c = (i % (WMMA_TILE_N / 8)) * 8;
         int row = tile_m + r, col = tile_n + c;
@@ -274,7 +277,7 @@ int main() {
     cudaMemcpy(d_offset_B, offset_B, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset_C, offset_C, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
 
-    // ============ 正确性验证: CPU vs WMMA GPU kernel ============
+    // ============ 正确性验证: CPU vs WMMA GPU kernel (64×64 tile) ============
     dim3 grid_w((N_DIM + WMMA_TILE_N - 1) / WMMA_TILE_N,
                 (260 + WMMA_TILE_M - 1) / WMMA_TILE_M, NUM_GROUPS);
     group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
@@ -292,7 +295,7 @@ int main() {
         max_err = fmaxf(max_err, err);
     }
 
-    std::cout << "\n=== 正确性验证 (CPU vs WMMA GPU) ===" << std::endl;
+    std::cout << "\n=== 正确性验证 (CPU vs WMMA GPU, 64×64 tile) ===" << std::endl;
     std::cout << "Max |CPU - GPU|: " << max_err << ", Error count (tol=1e-2): " << err_count << ", Inf/NaN: " << inf_count << std::endl;
     std::cout << (max_err < 1e-1f && inf_count == 0 ? "PASS: 结果正确!" : "FAIL") << std::endl;
 
@@ -326,7 +329,7 @@ int main() {
     double gflops = (total_flops / 1e9) / (ms / 1000.0);
     double gbs = (total_bytes / 1e9) / (ms / 1000.0);
 
-    std::cout << "\n=== 性能 (C 矩阵 uint4 向量化, RTX 4090) ===" << std::endl;
+    std::cout << "\n=== 性能 (64x64 tile, C uint4 向量化, RTX 4090) ===" << std::endl;
     std::cout << "总 M: " << total_M << ", K: " << K_DIM << ", N: " << N_DIM << std::endl;
     std::cout << "单次耗时: " << std::fixed << std::setprecision(4) << ms << " ms" << std::endl;
     std::cout << "计算效率: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS/s" << std::endl;
