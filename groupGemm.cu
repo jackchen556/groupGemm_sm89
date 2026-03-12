@@ -43,9 +43,11 @@ __device__ __forceinline__ void ld_uint4(const __half* src, __half* dst) {
 
 #define SWIZZLE_TILE 16     // Block swizzle: 水平 tiling 提高 L2 命中率
 
-// SA_LD/SB_LD=16: 符合 WMMA 最小 stride，16x16 tile 的 bank conflict 通常不严重
+// WMMA 16x16x16: 逻辑维度 16，stride 必须 = 实际内存行间距
 #define SA_LD 16
 #define SB_LD 16
+#define SA_BANK_PAD 8   // padding 消除 bank conflict，WMMA 只读 [0..15]
+#define SB_BANK_PAD 8
 #define SC_LD 32
 
 // ============ CPU 参考实现 (验证正确性) ============
@@ -100,8 +102,8 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
 
     if (blk_y * WMMA_TILE_M >= Mg) return;
 
-    __shared__ __half sA[2][WMMA_TILE_M][SA_LD];
-    __shared__ __half sB[2][WMMA_TILE_N][SB_LD];
+    __shared__ __half sA[2][WMMA_TILE_M][SA_LD + SA_BANK_PAD];  // padding 消除 bank conflict
+    __shared__ __half sB[2][WMMA_TILE_N][SB_LD + SB_BANK_PAD];
 
     int warpM = threadIdx.y / 2;  // 2x2 warps for 32x32 tile
     int warpN = threadIdx.y % 2;
@@ -176,8 +178,8 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
             }
         }
 
-        nvcuda::wmma::load_matrix_sync(a_frag, &sA[buf][warpM * WMMA_M][0], SA_LD);
-        nvcuda::wmma::load_matrix_sync(b_frag, &sB[buf][warpN * WMMA_N][0], SB_LD);
+        nvcuda::wmma::load_matrix_sync(a_frag, &sA[buf][warpM * WMMA_M][0], SA_LD + SA_BANK_PAD);
+        nvcuda::wmma::load_matrix_sync(b_frag, &sB[buf][warpN * WMMA_N][0], SB_LD + SB_BANK_PAD);
         nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
