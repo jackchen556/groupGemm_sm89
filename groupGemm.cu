@@ -1,15 +1,15 @@
-/**
- * Group GEMM - 手写 CUDA 实现 (WMMA Tensor Core)
- * 变体: C 矩阵 uint4 写回 + B 矩阵预转置 + 64×64 Tile 优化
+/*
+ * Group GEMM - CUDA Implementation with WMMA Tensor Core
+ * Variant: C uint4 Store + B Transpose + 64×64 Tile Optimization
  *
- * 功能: 8 对矩阵乘法 C[g] = A[g] * B[g]
- * - B 预转置为 B_T[k][n]=B[n][k]，K×N 布局，使 kernel 对 B 的加载变为连续访问
- * - M: 251~260 随机 8 个值 (每组不同)
+ * Function: 8 independent GEMM kernels C[g] = A[g] * B[g]
+ * - B is pre-transposed to B_T[k][n]=B[n][k] for contiguous memory access
+ * - M: 8 random values from 251 to 260 (different per group)
  * - K: 4096, N: 2048
- * - FP16 数据类型
- * - Tile 尺寸: 64×64 (原 32×32)，更大 tile 提升计算密度、减少 block 数量
+ * - Data type: FP16
+ * - Tile size: 64×64 (improves compute density vs 32×32)
  *
- * 编译 (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm_u4_tile64 group_gemm_u4_tile64.cu
+ * Compile (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm_u4_tile64 group_gemm_u4_tile64.cu
  */
 
 #include <iostream>
@@ -25,7 +25,7 @@ __device__ __forceinline__ __half ld_kernel(const __half* p) {
     return __ldg(p);
 }
 
-// uint4 = 16B = 8 half，最大化全局内存带宽（128-bit 向量化）
+// uint4 = 16B = 8 half elements, maximize global memory bandwidth (128-bit vectorized)
 __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half* __restrict__ dst) {
     *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
 }
@@ -37,21 +37,21 @@ __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half*
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-// 64×64 tile: 4×4 个 16×16 WMMA 块
+// 64×64 tile: 4×4 16×16 WMMA fragments
 #define WMMA_TILE_M 64
 #define WMMA_TILE_N 64
 #define WMMA_BLOCK_DIM 32
-#define WMMA_BLOCK_ROWS 16   // 16 warps = 512 threads，覆盖 4×4 WMMA 块
+#define WMMA_BLOCK_ROWS 16   // 16 warps = 512 threads, covers 4×4 WMMA tiles
 
 #define SWIZZLE_TILE 16
 
 #define SA_LD 16
 #define SA_BANK_PAD 8
-#define SB_LD 16       // WMMA col_major: sB[col][row], ld=16
+#define SB_LD 16
 #define SB_BANK_PAD 8
-#define SC_LD 64       // 64×64 accumulator
+#define SC_LD 64
 
-// ============ CPU 参考实现 ============
+// ============ CPU Reference Implementation ============
 void cpu_group_gemm_ref(
     const __half* A, const __half* B, __half* C,
     const int* M_list, int K, int N)
@@ -68,7 +68,7 @@ void cpu_group_gemm_ref(
             for (int n = 0; n < N; n++) {
                 float sum = 0.0f;
                 for (int k = 0; k < K; k++) {
-                    sum += __half2float(A[offset_A + m * K + k]) * __half2float(B[offset_B + k + n * N]);  // B_col[k+n*N]=B[n][k]
+                    sum += __half2float(A[offset_A + m * K + k]) * __half2float(B[offset_B + k + n * N]);
                 }
                 C[offset_C + m * N + n] = __float2half(sum);
             }
@@ -76,8 +76,8 @@ void cpu_group_gemm_ref(
     }
 }
 
-// ============ ld_uint4 双缓冲 + B_col 连续 + C uint4 写回 + 64×64 Tile ============
-__global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
+// ============ Double Buffer + Vectorized Load/Store + 64×64 WMMA ============
+__global__ __launch_bounds__(512) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
     __half* __restrict__ C,
@@ -104,12 +104,10 @@ __global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
     __shared__ __half sA[2][WMMA_TILE_M][SA_LD + SA_BANK_PAD];
     __shared__ __half sB[2][WMMA_TILE_N][SB_LD + SB_BANK_PAD];
 
-    // 4×4 warps: warpM 0~3, warpN 0~3
     int warpM = threadIdx.y / 4;
     int warpN = threadIdx.y % 4;
     int tile_m = blk_y * WMMA_TILE_M;
     int tile_n = blk_x * WMMA_TILE_N;
-    int tile_n_B = blk_x * WMMA_TILE_N;
     int ty = threadIdx.y, tx = threadIdx.x;
 
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> a_frag;
@@ -119,7 +117,7 @@ __global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
 
     int num_tiles_k = K / WMMA_K;
 
-    // 预加载第一块: 64×16 的 A, 64×16 的 B
+    // Prefetch first tile
     #pragma unroll 1
     for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 512) {
         int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
@@ -135,13 +133,13 @@ __global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
     #pragma unroll 1
     for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
         int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
-        int n_val = tile_n_B + col, k_val = row_base;
-        if (n_val < N && k_val + 7 < K)
-            ld_uint4(&B[base_B + n_val * N + k_val], &sB[0][col][row_base]);
+        int n_val = tile_n + col;
+        if (n_val < N && row_base + 7 < K)
+            ld_uint4(&B[base_B + n_val * N + row_base], &sB[0][col][row_base]);
         else {
             for (int i = 0; i < 8; i++)
-                sB[0][col][row_base + i] = (n_val < N && k_val + i < K) ?
-                    ld_kernel(&B[base_B + n_val * N + k_val + i]) : __float2half(0.0f);
+                sB[0][col][row_base + i] = (n_val < N && row_base + i < K) ?
+                    ld_kernel(&B[base_B + n_val * N + row_base + i]) : __float2half(0.0f);
         }
     }
     __syncthreads();
@@ -167,13 +165,13 @@ __global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
             #pragma unroll 1
             for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
                 int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
-                int n_val = tile_n_B + col, k_val = k_next + row_base;
-                if (n_val < N && k_val + 7 < K)
-                    ld_uint4(&B[base_B + n_val * N + k_val], &sB[next_buf][col][row_base]);
+                int n_val = tile_n + col;
+                if (n_val < N && k_next + row_base + 7 < K)
+                    ld_uint4(&B[base_B + n_val * N + k_next + row_base], &sB[next_buf][col][row_base]);
                 else {
                     for (int i = 0; i < 8; i++)
-                        sB[next_buf][col][row_base + i] = (n_val < N && k_val + i < K) ?
-                            ld_kernel(&B[base_B + n_val * N + k_val + i]) : __float2half(0.0f);
+                        sB[next_buf][col][row_base + i] = (n_val < N && k_next + row_base + i < K) ?
+                            ld_kernel(&B[base_B + n_val * N + k_next + row_base + i]) : __float2half(0.0f);
                 }
             }
         }
@@ -188,7 +186,7 @@ __global__ __launch_bounds__(512 ) void group_gemm_wmma_fused_kernel(
     nvcuda::wmma::store_matrix_sync(&sC[warpM * WMMA_M][warpN * WMMA_N], c_frag, SC_LD, nvcuda::wmma::mem_row_major);
     __syncthreads();
 
-    // C 矩阵写回: uint4 向量化 (128-bit 批量写)
+    // Vectorized store C with uint4 (128-bit)
     #pragma unroll 4
     for (int i = ty * 32 + tx; i < WMMA_TILE_M * (WMMA_TILE_N / 8); i += 512) {
         int r = i / (WMMA_TILE_N / 8);
@@ -247,7 +245,7 @@ int main() {
                 h_B[off + n * K_DIM + k] = __float2half((float)(rand() % 10) / 100.0f);
     }
 
-    // B 预转置为 B_col col-major: B_col[k+n*N]=B[n][k]，每列 k 连续，匹配 WMMA 硬件
+    // Pre-transpose B to column-major for WMMA
     __half* h_B_col = (__half*)malloc(size_B);
     for (int g = 0; g < NUM_GROUPS; g++) {
         int off = offset_B[g];
@@ -257,7 +255,7 @@ int main() {
     }
 
     cpu_group_gemm_ref(h_A, h_B_col, h_C_ref, M_list, K_DIM, N_DIM);
-    free(h_B);  // 转置后不再需要原始 B
+    free(h_B);
 
     __half *d_A, *d_B, *d_C;
     int *d_M_list, *d_offset_A, *d_offset_B, *d_offset_C;
@@ -277,7 +275,7 @@ int main() {
     cudaMemcpy(d_offset_B, offset_B, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset_C, offset_C, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
 
-    // ============ 正确性验证: CPU vs WMMA GPU kernel (64×64 tile) ============
+    // ============ Correctness Check: CPU vs GPU WMMA (64×64 tile) ============
     dim3 grid_w((N_DIM + WMMA_TILE_N - 1) / WMMA_TILE_N,
                 (260 + WMMA_TILE_M - 1) / WMMA_TILE_M, NUM_GROUPS);
     group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
@@ -295,11 +293,11 @@ int main() {
         max_err = fmaxf(max_err, err);
     }
 
-    std::cout << "\n=== 正确性验证 (CPU vs WMMA GPU, 64×64 tile) ===" << std::endl;
+    std::cout << "\n=== Correctness Check (CPU vs WMMA GPU, 64×64 tile) ===" << std::endl;
     std::cout << "Max |CPU - GPU|: " << max_err << ", Error count (tol=1e-2): " << err_count << ", Inf/NaN: " << inf_count << std::endl;
-    std::cout << (max_err < 1e-1f && inf_count == 0 ? "PASS: 结果正确!" : "FAIL") << std::endl;
+    std::cout << (max_err < 1e-1f && inf_count == 0 ? "PASS: Results match!" : "FAIL") << std::endl;
 
-    // ============ 性能测试 (RTX 4090) ============
+    // ============ Performance Benchmark (RTX 4090) ============
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -329,11 +327,11 @@ int main() {
     double gflops = (total_flops / 1e9) / (ms / 1000.0);
     double gbs = (total_bytes / 1e9) / (ms / 1000.0);
 
-    std::cout << "\n=== 性能 (64x64 tile, C uint4 向量化, RTX 4090) ===" << std::endl;
-    std::cout << "总 M: " << total_M << ", K: " << K_DIM << ", N: " << N_DIM << std::endl;
-    std::cout << "单次耗时: " << std::fixed << std::setprecision(4) << ms << " ms" << std::endl;
-    std::cout << "计算效率: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS/s" << std::endl;
-    std::cout << "内存带宽: " << std::fixed << std::setprecision(2) << gbs << " GB/s" << std::endl;
+    std::cout << "\n=== Performance (64x64 tile, C uint4 vectorized, RTX 4090) ===" << std::endl;
+    std::cout << "Total M: " << total_M << ", K: " << K_DIM << ", N: " << N_DIM << std::endl;
+    std::cout << "Latency per kernel: " << std::fixed << std::setprecision(4) << ms << " ms" << std::endl;
+    std::cout << "Compute throughput: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS/s" << std::endl;
+    std::cout << "Memory bandwidth: " << std::fixed << std::setprecision(2) << gbs << " GB/s" << std::endl;
 
     cudaFree(d_A);
     cudaFree(d_B);
