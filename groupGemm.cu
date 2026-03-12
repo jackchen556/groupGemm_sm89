@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -24,9 +25,12 @@ __device__ __forceinline__ __half ld_kernel(const __half* p) {
 }
 
 // uint4 = 16B = 8 half，最大化全局内存带宽（128-bit 向量化）
-__device__ __forceinline__ void ld_uint4(const __half* src, __half* dst) {
+__device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half* __restrict__ dst) {
     *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
 }
+
+
+
 
 #define NUM_GROUPS 8
 #define K_DIM 4096
@@ -304,6 +308,10 @@ int main() {
         max_err_simple = fmaxf(max_err_simple, fabsf(__half2float(h_C_ref[i]) - __half2float(h_C[i])));
     std::cout << "Simple kernel vs CPU max err: " << max_err_simple << std::endl;
 
+    // 保存 Simple 结果，用于交叉验证 WMMA
+    __half* h_C_simple = (__half*)malloc(size_C);
+    memcpy(h_C_simple, h_C, size_C);
+
     dim3 grid_w((N_DIM + WMMA_TILE_N - 1) / WMMA_TILE_N,
                 (260 + WMMA_TILE_M - 1) / WMMA_TILE_M, NUM_GROUPS);
     group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
@@ -321,9 +329,18 @@ int main() {
         max_err_wmma = fmaxf(max_err_wmma, err);
     }
 
+    // 交叉验证：WMMA vs Simple（若 B 布局不一致，两者会不同）
+    float max_err_wmma_vs_simple = 0.0f;
+    for (size_t i = 0; i < total_M * N_DIM; i++)
+        max_err_wmma_vs_simple = fmaxf(max_err_wmma_vs_simple,
+            fabsf(__half2float(h_C[i]) - __half2float(h_C_simple[i])));
+
     std::cout << "\n=== 正确性验证 (WMMA vs CPU) ===" << std::endl;
     std::cout << "Max |CPU - GPU|: " << max_err_wmma << ", Error count (tol=1e-2): " << err_count << ", Inf/NaN: " << inf_count << std::endl;
-    std::cout << (max_err_wmma < 1e-1f && inf_count == 0 ? "PASS: 结果正确!" : "FAIL") << std::endl;
+    std::cout << "WMMA vs Simple max err: " << max_err_wmma_vs_simple << " (应为 0，否则 B 布局可能不一致)" << std::endl;
+    std::cout << (max_err_wmma < 1e-1f && inf_count == 0 && max_err_wmma_vs_simple < 1e-2f ? "PASS: 结果正确!" : "FAIL") << std::endl;
+
+    free(h_C_simple);
 
     // ============ 性能测试 (RTX 4090) ============
     cudaEvent_t start, stop;
@@ -348,6 +365,7 @@ int main() {
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
     ms /= repeat;
+    if (ms < 0.001f) ms = 0.001f;  // 避免计时分辨率不足导致 inf
 
     double total_flops = 2.0 * (double)total_M * K_DIM * N_DIM;
     double total_bytes = size_A + size_B + size_C;
