@@ -26,16 +26,6 @@
 #define SB_LD 16
 #define SC_LD 40
 
-__device__ __forceinline__ __half ld_kernel(const __half* addr) {
-    __half res;
-    asm volatile(
-        "ld.global.nc.u16 %0, [%1]; \n"
-        :"=h"(res)
-        : "l"(addr)
-        );
-    return res;
-}
-
 // ============ CPU 参考实现 (验证正确性) ============
 void cpu_group_gemm_ref(
     const __half* A, const __half* B, __half* C,
