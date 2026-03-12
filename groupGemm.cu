@@ -286,8 +286,8 @@ int main() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    const int warmup = 20;
-    const int repeat = 200;
+    const int warmup = 5;
+    const int repeat = 10;
 
     for (int i = 0; i < warmup; i++)
         group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
