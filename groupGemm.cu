@@ -1,3 +1,15 @@
+/**
+ * Group GEMM - 手写 CUDA 实现 (WMMA Tensor Core)
+ * 功能: 8 对矩阵乘法 C[g] = A[g] * B[g]
+ * - M: 251~260 随机 8 个值 (每组不同)
+ * - K: 4096, N: 2048
+ * - FP16 数据类型
+ * - CPU 验证正确性
+ * - 输出: 计算效率 GFLOPS/s, 内存带宽 GB/s (RTX 4090)
+ *
+ * 编译 (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm group_gemm.cu
+ * 可选: --ptxas-options=-O3 进一步优化 PTX
+ */
 
 #include <iostream>
 #include <iomanip>
@@ -7,7 +19,14 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
-#define LDG(p) __ldg(p)
+__device__ __forceinline__ __half ld_kernel(const __half* p) {
+    return __ldg(p);  // 编译为 ld.global.nc.u16，零转换开销
+}
+
+// uint4 = 16B = 8 half，最大化全局内存带宽（128-bit 向量化）
+__device__ __forceinline__ void ld_uint4(const __half* src, __half* dst) {
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+}
 
 #define NUM_GROUPS 8
 #define K_DIM 4096
@@ -22,9 +41,12 @@
 #define WMMA_BLOCK_DIM 32
 #define WMMA_BLOCK_ROWS 4   // 4 warps (2x2) for 32x32
 
+#define SWIZZLE_TILE 16     // Block swizzle: 水平 tiling 提高 L2 命中率
+
+// SA_LD/SB_LD=16: 符合 WMMA 最小 stride，16x16 tile 的 bank conflict 通常不严重
 #define SA_LD 16
 #define SB_LD 16
-#define SC_LD 40
+#define SC_LD 32
 
 // ============ CPU 参考实现 (验证正确性) ============
 void cpu_group_gemm_ref(
@@ -52,6 +74,7 @@ void cpu_group_gemm_ref(
 }
 
 // ============ 手写 WMMA 融合 kernel (3D grid, 双缓冲, 32x32 tile 适配小 M) ============
+// Ada SM89: max 1536 threads/SM，16*128=2048 超限；minBlocksPerSM=8 -> 1024 threads/SM
 __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
@@ -68,16 +91,23 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
     int base_B = offset_B[g];
     int base_C = offset_C[g];
 
-    if (blockIdx.y * WMMA_TILE_M >= Mg) return;
+    // Block swizzle: 重排 block 发射顺序，使相邻 block 访问的 L2 数据更接近
+    int block_idx = blockIdx.y * gridDim.x + blockIdx.x;
+    int tile_id = block_idx / (SWIZZLE_TILE * gridDim.y);
+    int pos_in_tile = block_idx % (SWIZZLE_TILE * gridDim.y);
+    int blk_y = pos_in_tile / SWIZZLE_TILE;
+    int blk_x = tile_id * SWIZZLE_TILE + (pos_in_tile % SWIZZLE_TILE);
+
+    if (blk_y * WMMA_TILE_M >= Mg) return;
 
     __shared__ __half sA[2][WMMA_TILE_M][SA_LD];
     __shared__ __half sB[2][WMMA_TILE_N][SB_LD];
 
     int warpM = threadIdx.y / 2;  // 2x2 warps for 32x32 tile
     int warpN = threadIdx.y % 2;
-    int tile_m = blockIdx.y * WMMA_TILE_M + warpM * WMMA_M;
-    int tile_n = blockIdx.x * WMMA_TILE_N + warpN * WMMA_N;
-    int tile_n_B = blockIdx.x * WMMA_TILE_N;
+    int tile_m = blk_y * WMMA_TILE_M;
+    int tile_n = blk_x * WMMA_TILE_N;
+    int tile_n_B = blk_x * WMMA_TILE_N;
     int ty = threadIdx.y, tx = threadIdx.x;
 
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> a_frag;
@@ -87,19 +117,30 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
 
     int num_tiles_k = K / WMMA_K;
 
-#pragma unroll 4
-    for (int i = ty * 32 + tx; i < WMMA_TILE_M * SA_LD; i += 128) {
-        int row = i / SA_LD, col = i % SA_LD;
-        int gr = blockIdx.y * WMMA_TILE_M + row;
-        sA[0][row][col] = (col < WMMA_K && gr < Mg && col < K) ?
-            LDG(&A[base_A + gr * K + col]) : __float2half(0.0f);
+    // uint4 向量化 (8 half/load)：减少 load 指令数，拉满全局内存带宽
+    #pragma unroll 1
+    for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 128) {
+        int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
+        int gr = blk_y * WMMA_TILE_M + row;
+        if (gr < Mg && col + 7 < K)
+            ld_uint4(&A[base_A + gr * K + col], &sA[0][row][col]);
+        else {
+            for (int i = 0; i < 8; i++)
+                sA[0][row][col + i] = (col + i < WMMA_K && gr < Mg && col + i < K) ?
+                    ld_kernel(&A[base_A + gr * K + col + i]) : __float2half(0.0f);
+        }
     }
-#pragma unroll 4
-    for (int i = ty * 32 + tx; i < WMMA_TILE_N * SB_LD; i += 128) {
-        int col = i / SB_LD, row = i % SB_LD;
+    #pragma unroll 1
+    for (int t = ty * 32 + tx; t < WMMA_TILE_N * (SB_LD / 8); t += 128) {
+        int col = t / (SB_LD / 8), row = (t % (SB_LD / 8)) * 8;
         int gc = tile_n_B + col;
-        sB[0][col][row] = (row < WMMA_K && row < K && gc < N) ?
-            LDG(&B[base_B + gc * K + row]) : __float2half(0.0f);
+        if (gc < N && row + 7 < K)
+            ld_uint4(&B[base_B + gc * K + row], &sB[0][col][row]);
+        else {
+            for (int i = 0; i < 8; i++)
+                sB[0][col][row + i] = (row + i < WMMA_K && row + i < K && gc < N) ?
+                    ld_kernel(&B[base_B + gc * K + row + i]) : __float2half(0.0f);
+        }
     }
     __syncthreads();
 
@@ -109,19 +150,29 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
         int k_next = (k + 1) * WMMA_K;
 
         if (k + 1 < num_tiles_k) {
-#pragma unroll 4
-            for (int i = ty * 32 + tx; i < WMMA_TILE_M * SA_LD; i += 128) {
-                int row = i / SA_LD, col = i % SA_LD;
-                int gr = blockIdx.y * WMMA_TILE_M + row;
-                sA[next_buf][row][col] = (col < WMMA_K && gr < Mg && k_next + col < K) ?
-                    LDG(&A[base_A + gr * K + k_next + col]) : __float2half(0.0f);
+            #pragma unroll 1
+            for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 128) {
+                int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
+                int gr = blk_y * WMMA_TILE_M + row;
+                if (gr < Mg && k_next + col + 7 < K)
+                    ld_uint4(&A[base_A + gr * K + k_next + col], &sA[next_buf][row][col]);
+                else {
+                    for (int i = 0; i < 8; i++)
+                        sA[next_buf][row][col + i] = (col + i < WMMA_K && gr < Mg && k_next + col + i < K) ?
+                            ld_kernel(&A[base_A + gr * K + k_next + col + i]) : __float2half(0.0f);
+                }
             }
-#pragma unroll 4
-            for (int i = ty * 32 + tx; i < WMMA_TILE_N * SB_LD; i += 128) {
-                int col = i / SB_LD, row = i % SB_LD;
+            #pragma unroll 1
+            for (int t = ty * 32 + tx; t < WMMA_TILE_N * (SB_LD / 8); t += 128) {
+                int col = t / (SB_LD / 8), row = (t % (SB_LD / 8)) * 8;
                 int gc = tile_n_B + col;
-                sB[next_buf][col][row] = (row < WMMA_K && k_next + row < K && gc < N) ?
-                    LDG(&B[base_B + gc * K + k_next + row]) : __float2half(0.0f);
+                if (gc < N && k_next + row + 7 < K)
+                    ld_uint4(&B[base_B + gc * K + k_next + row], &sB[next_buf][col][row]);
+                else {
+                    for (int i = 0; i < 8; i++)
+                        sB[next_buf][col][row + i] = (row + i < WMMA_K && k_next + row + i < K && gc < N) ?
+                            ld_kernel(&B[base_B + gc * K + k_next + row + i]) : __float2half(0.0f);
+                }
             }
         }
 
@@ -135,12 +186,13 @@ __global__ __launch_bounds__(128, 8) void group_gemm_wmma_fused_kernel(
     nvcuda::wmma::store_matrix_sync(&sC[warpM * WMMA_M][warpN * WMMA_N], c_frag, SC_LD, nvcuda::wmma::mem_row_major);
     __syncthreads();
 
-#pragma unroll
-    for (int i = ty * 32 + tx; i < WMMA_M * WMMA_N; i += 128) {
-        int r = i / WMMA_N, c = i % WMMA_N;
+    // 输出: 覆盖整个 32x32 tile (4 warps)
+#pragma unroll 8
+    for (int i = ty * 32 + tx; i < WMMA_TILE_M * WMMA_TILE_N; i += 128) {
+        int r = i / WMMA_TILE_N, c = i % WMMA_TILE_N;
         int row = tile_m + r, col = tile_n + c;
         if (row < Mg && col < N)
-            C[base_C + row * N + col] = __float2half(sC[warpM * WMMA_M + r][warpN * WMMA_N + c]);
+            C[base_C + row * N + col] = __float2half(sC[r][c]);
     }
 }
 
@@ -276,8 +328,8 @@ int main() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    const int warmup = 5;
-    const int repeat = 10;
+    const int warmup = 20;
+    const int repeat = 200;
 
     for (int i = 0; i < warmup; i++)
         group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
@@ -322,4 +374,3 @@ int main() {
 
     return 0;
 }
-
