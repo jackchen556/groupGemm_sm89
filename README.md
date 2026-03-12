@@ -3,6 +3,20 @@
 ## 运行结果
 
 ```
+cublas:
+M values: 257 251 252 252 253 259 252 251 
+
+=== 正确性验证 (CPU vs cuBLAS GPU) ===
+Max |CPU - GPU|: 0.0390625, Error count (tol=1e-2): 404152, Inf/NaN: 0
+PASS: 结果正确!
+
+=== 性能 (cuBLAS FP16 Tensor Core) ===
+总 M: 2027, K: 4096, N: 2048
+单次耗时: 0.9834 ms
+计算效率: 34582.76 GFLOPS/s (34.58 TFLOPS)
+内存带宽: 161.82 GB/s
+
+cuda:
 M values: 257 251 252 252 253 259 252 251 
 Simple kernel vs CPU max err: 0
 
