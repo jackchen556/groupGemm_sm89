@@ -4,16 +4,15 @@
 ## 运行结果
 
 ```
-
 ============================================================
   Group GEMM Benchmark
 ============================================================
-  GPU Device: NVIDIA GeForce RTX 4090 D
+  GPU Device: NVIDIA GeForce RTX 4090
   Compute Capability: 8.9
   Global Memory: 24080 MB
 ------------------------------------------------------------
   Problem Config:
-    M per group: 257, 251, 252, 252, 253, 259, 252, 251  (total M = 2027)
+    M per group: 258, 251, 253, 252, 254, 254, 253, 260  (total M = 2035)
     K = 4096, N = 2048
 ------------------------------------------------------------
   Check CPU vs GPU:
@@ -23,8 +22,8 @@
     Result:              PASS
 ------------------------------------------------------------
   Performance (GPU):
-    Latency:            0.7680 ms
-    Compute throughput:  44283.15 GFLOPS/s
-    Memory bandwidth:   207.21 GB/s
+    Latency:            0.6431 ms
+    Compute throughput:  53085.20 GFLOPS/s
+    Memory bandwidth:   247.57 GB/s
 ============================================================
 ```
