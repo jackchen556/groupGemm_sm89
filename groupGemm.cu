@@ -267,7 +267,8 @@ int main() {
 
     dim3 grid_w((N_DIM + WMMA_TILE_N - 1) / WMMA_TILE_N,
                 (260 + WMMA_TILE_M - 1) / WMMA_TILE_M, NUM_GROUPS);
-    group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
+    dim3 block_w(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS);
+    group_gemm_wmma_fused_kernel<<<grid_w, block_w>>>(d_A, d_B, d_C,
         d_M_list, d_offset_A, d_offset_B, d_offset_C, K_DIM, N_DIM);
     cudaMemcpy(h_C, d_C, size_C, cudaMemcpyDeviceToHost);
 
