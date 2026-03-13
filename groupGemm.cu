@@ -1,16 +1,4 @@
-/*
- * Group GEMM - CUDA Implementation with WMMA Tensor Core
- * Variant: C uint4 Store + B Transpose + 64×64 Tile Optimization
- *
- * Function: 8 independent GEMM kernels C[g] = A[g] * B[g]
- * - B is pre-transposed to B_T[k][n]=B[n][k] for contiguous memory access
- * - M: 8 random values from 251 to 260 (different per group)
- * - K: 4096, N: 2048
- * - Data type: FP16
- * - Tile size: 64×64 (improves compute density vs 32×32)
- *
- * Compile (RTX 4090): nvcc -O3 -arch=sm_89 --use_fast_math -o group_gemm_u4_tile64 group_gemm_u4_tile64.cu
- */
+
 
 #include <iostream>
 #include <iomanip>
@@ -25,7 +13,6 @@ __device__ __forceinline__ __half ld_kernel(const __half* p) {
     return __ldg(p);
 }
 
-// uint4 = 16B = 8 half elements, maximize global memory bandwidth (128-bit vectorized)
 __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half* __restrict__ dst) {
     *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
 }
@@ -74,7 +61,7 @@ void cpu_group_gemm_ref(
     }
 }
 
-// ============ Double Buffer + Vectorized Load/Store + 64×64 WMMA ============
+// ====== gpu implement =======
 __global__ __launch_bounds__(512) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
