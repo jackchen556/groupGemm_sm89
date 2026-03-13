@@ -75,18 +75,15 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     int base_B = offset_B[g];
     int base_C = offset_C[g];
 
-    int blk_x = blockIdx.x;
-    int blk_y = blockIdx.y;
-
-    if (blk_y * WMMA_TILE_M >= Mg) return;
+    if (blockIdx.y * WMMA_TILE_M >= Mg) return;
 
     __shared__ __half sA[2][WMMA_TILE_M][SA_LD + SA_BANK_PAD];
     __shared__ __half sB[2][WMMA_TILE_N][SB_LD + SB_BANK_PAD];
 
     int warpM = threadIdx.y / 4;
     int warpN = threadIdx.y % 4;
-    int tile_m = blk_y * WMMA_TILE_M;
-    int tile_n = blk_x * WMMA_TILE_N;
+    int tile_m = blockIdx.y * WMMA_TILE_M;
+    int tile_n = blockIdx.x * WMMA_TILE_N;
     int ty = threadIdx.y, tx = threadIdx.x;
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
@@ -122,6 +119,7 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     }
     __syncthreads();
 
+    #pragma unroll 1
     for (int k = 0; k < num_tiles_k; k++) {
         int buf = k & 1;
         int next_buf = 1 - buf;
@@ -186,15 +184,32 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
 int main() {
     srand(42);
 
+    // 获取并打印当前 GPU 信息
+    int device_id = 0;
+    cudaSetDevice(device_id);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device_id);
+
+    std::cout << std::string(60, '=') << std::endl;
+    std::cout << "  Group GEMM Benchmark" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    std::cout << "  GPU Device: " << prop.name << std::endl;
+    std::cout << "  Compute Capability: " << prop.major << "." << prop.minor << std::endl;
+    std::cout << "  Global Memory: " << (prop.totalGlobalMem / (1024 * 1024)) << " MB" << std::endl;
+    std::cout << std::string(60, '-') << std::endl;
+
     int M_list[NUM_GROUPS];
     int total_M = 0;
-    std::cout << "M values: ";
+    std::cout << "  Problem Config:" << std::endl;
+    std::cout << "    M per group: ";
     for (int g = 0; g < NUM_GROUPS; g++) {
         M_list[g] = 251 + (rand() % 10);
         total_M += M_list[g];
-        std::cout << M_list[g] << " ";
+        std::cout << M_list[g] << (g < NUM_GROUPS - 1 ? ", " : "");
     }
-    std::cout << std::endl;
+    std::cout << "  (total M = " << total_M << ")" << std::endl;
+    std::cout << "    K = " << K_DIM << ", N = " << N_DIM << std::endl;
+    std::cout << std::string(60, '-') << std::endl;
 
     int offset_A[NUM_GROUPS], offset_B[NUM_GROUPS], offset_C[NUM_GROUPS];
     offset_A[0] = offset_B[0] = offset_C[0] = 0;
@@ -268,9 +283,12 @@ int main() {
         max_err = fmaxf(max_err, err);
     }
 
-    std::cout << "\n=== Correctness Check (CPU vs WMMA GPU, 64×64 tile) ===" << std::endl;
-    std::cout << "Max |CPU - GPU|: " << max_err << ", Error count (tol=1e-2): " << err_count << ", Inf/NaN: " << inf_count << std::endl;
-    std::cout << (max_err < 1e-1f && inf_count == 0 ? "PASS: Results match!" : "FAIL") << std::endl;
+    std::cout << "  Check CPU vs GPU:" << std::endl;
+    std::cout << "    Max |CPU - GPU|:     " << std::scientific << std::setprecision(4) << max_err << std::endl;
+    std::cout << "    Error count (1e-2):  " << err_count << std::endl;
+    std::cout << "    Inf/NaN count:       " << inf_count << std::endl;
+    std::cout << "    Result:              " << (max_err < 1e-1f && inf_count == 0 ? "PASS" : "FAIL") << std::endl;
+    std::cout << std::string(60, '-') << std::endl;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -301,11 +319,11 @@ int main() {
     double gflops = (total_flops / 1e9) / (ms / 1000.0);
     double gbs = (total_bytes / 1e9) / (ms / 1000.0);
 
-    std::cout << "\n=== Performance (64x64 tile, C uint4 vectorized, RTX 4090) ===" << std::endl;
-    std::cout << "Total M: " << total_M << ", K: " << K_DIM << ", N: " << N_DIM << std::endl;
-    std::cout << "Latency per kernel: " << std::fixed << std::setprecision(4) << ms << " ms" << std::endl;
-    std::cout << "Compute throughput: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS/s" << std::endl;
-    std::cout << "Memory bandwidth: " << std::fixed << std::setprecision(2) << gbs << " GB/s" << std::endl;
+    std::cout << "  Performance (GPU):" << std::endl;
+    std::cout << "    Latency:            " << std::fixed << std::setprecision(4) << ms << " ms" << std::endl;
+    std::cout << "    Compute throughput:  " << std::setprecision(2) << gflops << " GFLOPS/s" << std::endl;
+    std::cout << "    Memory bandwidth:   " << std::setprecision(2) << gbs << " GB/s" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
 
     cudaFree(d_A);
     cudaFree(d_B);
