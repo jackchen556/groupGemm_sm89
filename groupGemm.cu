@@ -182,9 +182,8 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
 }
 
 int main() {
-    srand(42);
+    srand(26);
 
-    // 获取并打印当前 GPU 信息
     int device_id = 0;
     cudaSetDevice(device_id);
     cudaDeviceProp prop;
