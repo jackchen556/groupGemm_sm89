@@ -299,13 +299,13 @@ int main() {
     const int repeat = 200;
 
     for (int i = 0; i < warmup; i++)
-        group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
+        group_gemm_wmma_fused_kernel<<<grid_w, block_w>>>(d_A, d_B, d_C,
             d_M_list, d_offset_A, d_offset_B, d_offset_C, K_DIM, N_DIM);
     cudaDeviceSynchronize();
 
     cudaEventRecord(start);
     for (int i = 0; i < repeat; i++)
-        group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
+        group_gemm_wmma_fused_kernel<<<grid_w, block_w>>>(d_A, d_B, d_C,
             d_M_list, d_offset_A, d_offset_B, d_offset_C, K_DIM, N_DIM);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
