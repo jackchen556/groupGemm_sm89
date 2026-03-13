@@ -204,7 +204,8 @@ int main() {
     for (int g = 0; g < NUM_GROUPS; g++) {
         M_list[g] = 251 + (rand() % 10);
         total_M += M_list[g];
-        std::cout << M_list[g] << (g < NUM_GROUPS - 1 ? ", " : "");
+        std::cout << M_list[g];
+        if (g < NUM_GROUPS - 1) std::cout << ", ";
     }
     std::cout << "  (total M = " << total_M << ")" << std::endl;
     std::cout << "    K = " << K_DIM << ", N = " << N_DIM << std::endl;
