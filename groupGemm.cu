@@ -1,5 +1,3 @@
-
-
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
@@ -8,6 +6,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+
+using namespace nvcuda;
 
 __device__ __forceinline__ __half ld_kernel(const __half* p) {
     return __ldg(p);
@@ -21,14 +21,10 @@ __device__ __forceinline__ void ld_uint4(const __half* __restrict__ src, __half*
 #define K_DIM 4096
 #define N_DIM 2048
 
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
-// 64×64 tile: 4×4 16×16 WMMA fragments
 #define WMMA_TILE_M 64
 #define WMMA_TILE_N 64
 #define WMMA_BLOCK_DIM 32
-#define WMMA_BLOCK_ROWS 16   // 16 warps = 512 threads, covers 4×4 WMMA tiles
+#define WMMA_BLOCK_ROWS 16
 
 #define SA_LD 16
 #define SA_BANK_PAD 8
@@ -62,6 +58,7 @@ void cpu_group_gemm_ref(
 }
 
 // ====== gpu implement =======
+// wmma 16*16*16
 __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
@@ -92,14 +89,13 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     int tile_n = blk_x * WMMA_TILE_N;
     int ty = threadIdx.y, tx = threadIdx.x;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> a_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::col_major> b_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
 
-    int num_tiles_k = K / WMMA_K;
+    int num_tiles_k = K / 16;
 
-    // Prefetch first tile
     #pragma unroll 1
     for (int t = ty * 32 + tx; t < WMMA_TILE_M * (SA_LD / 8); t += 512) {
         int row = t / (SA_LD / 8), col = (t % (SA_LD / 8)) * 8;
@@ -108,13 +104,13 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
             ld_uint4(&A[base_A + gr * K + col], &sA[0][row][col]);
         else {
             for (int i = 0; i < 8; i++)
-                sA[0][row][col + i] = (col + i < WMMA_K && gr < Mg && col + i < K) ?
+                sA[0][row][col + i] = (col + i < 16 && gr < Mg && col + i < K) ?
                     ld_kernel(&A[base_A + gr * K + col + i]) : __float2half(0.0f);
         }
     }
     #pragma unroll 1
-    for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
-        int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
+    for (int t = ty * 32 + tx; t < WMMA_TILE_N * (16 / 8); t += 512) {
+        int col = t / (16 / 8), row_base = (t % (16 / 8)) * 8;
         int n_val = tile_n + col;
         if (n_val < N && row_base + 7 < K)
             ld_uint4(&B[base_B + n_val * N + row_base], &sB[0][col][row_base]);
@@ -129,7 +125,7 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     for (int k = 0; k < num_tiles_k; k++) {
         int buf = k & 1;
         int next_buf = 1 - buf;
-        int k_next = (k + 1) * WMMA_K;
+        int k_next = (k + 1) * 16;
 
         if (k + 1 < num_tiles_k) {
             #pragma unroll 1
@@ -140,13 +136,13 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
                     ld_uint4(&A[base_A + gr * K + k_next + col], &sA[next_buf][row][col]);
                 else {
                     for (int i = 0; i < 8; i++)
-                        sA[next_buf][row][col + i] = (col + i < WMMA_K && gr < Mg && k_next + col + i < K) ?
+                        sA[next_buf][row][col + i] = (col + i < 16 && gr < Mg && k_next + col + i < K) ?
                             ld_kernel(&A[base_A + gr * K + k_next + col + i]) : __float2half(0.0f);
                 }
             }
             #pragma unroll 1
-            for (int t = ty * 32 + tx; t < WMMA_TILE_N * (WMMA_K / 8); t += 512) {
-                int col = t / (WMMA_K / 8), row_base = (t % (WMMA_K / 8)) * 8;
+            for (int t = ty * 32 + tx; t < WMMA_TILE_N * (16 / 8); t += 512) {
+                int col = t / (16 / 8), row_base = (t % (16 / 8)) * 8;
                 int n_val = tile_n + col;
                 if (n_val < N && k_next + row_base + 7 < K)
                     ld_uint4(&B[base_B + n_val * N + k_next + row_base], &sB[next_buf][col][row_base]);
@@ -158,17 +154,16 @@ __global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
             }
         }
 
-        nvcuda::wmma::load_matrix_sync(a_frag, &sA[buf][warpM * WMMA_M][0], SA_LD + SA_BANK_PAD);
-        nvcuda::wmma::load_matrix_sync(b_frag, &sB[buf][warpN * WMMA_N][0], SB_LD + SB_BANK_PAD);
-        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        wmma::load_matrix_sync(a_frag, &sA[buf][warpM * 16][0], SA_LD + SA_BANK_PAD);
+        wmma::load_matrix_sync(b_frag, &sB[buf][warpN * 16][0], SB_LD + SB_BANK_PAD);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
 
     __shared__ float sC[WMMA_TILE_M][SC_LD];
-    nvcuda::wmma::store_matrix_sync(&sC[warpM * WMMA_M][warpN * WMMA_N], c_frag, SC_LD, nvcuda::wmma::mem_row_major);
+    wmma::store_matrix_sync(&sC[warpM * 16][warpN * 16], c_frag, SC_LD, wmma::mem_row_major);
     __syncthreads();
 
-    // Vectorized store C with uint4 (128-bit)
     #pragma unroll 4
     for (int i = ty * 32 + tx; i < WMMA_TILE_M * (WMMA_TILE_N / 8); i += 512) {
         int r = i / (WMMA_TILE_N / 8);
@@ -227,7 +222,6 @@ int main() {
                 h_B[off + n * K_DIM + k] = __float2half((float)(rand() % 10) / 100.0f);
     }
 
-    // Pre-transpose B to column-major for WMMA
     __half* h_B_col = (__half*)malloc(size_B);
     for (int g = 0; g < NUM_GROUPS; g++) {
         int off = offset_B[g];
@@ -257,7 +251,6 @@ int main() {
     cudaMemcpy(d_offset_B, offset_B, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset_C, offset_C, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice);
 
-    // ============ Correctness Check: CPU vs GPU WMMA (64×64 tile) ============
     dim3 grid_w((N_DIM + WMMA_TILE_N - 1) / WMMA_TILE_N,
                 (260 + WMMA_TILE_M - 1) / WMMA_TILE_M, NUM_GROUPS);
     group_gemm_wmma_fused_kernel<<<grid_w, dim3(WMMA_BLOCK_DIM, WMMA_BLOCK_ROWS)>>>(d_A, d_B, d_C,
@@ -279,7 +272,6 @@ int main() {
     std::cout << "Max |CPU - GPU|: " << max_err << ", Error count (tol=1e-2): " << err_count << ", Inf/NaN: " << inf_count << std::endl;
     std::cout << (max_err < 1e-1f && inf_count == 0 ? "PASS: Results match!" : "FAIL") << std::endl;
 
-    // ============ Performance Benchmark (RTX 4090) ============
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
