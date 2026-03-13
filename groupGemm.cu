@@ -62,7 +62,7 @@ void cpu_group_gemm_ref(
 }
 
 // ====== gpu implement =======
-__global__ __launch_bounds__(512) void group_gemm_wmma_fused_kernel(
+__global__ __launch_bounds__(512, 2) void group_gemm_wmma_fused_kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
     __half* __restrict__ C,
